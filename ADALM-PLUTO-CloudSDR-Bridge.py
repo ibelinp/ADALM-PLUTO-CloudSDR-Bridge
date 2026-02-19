@@ -1310,6 +1310,9 @@ class CloudSDREmulator:
             else:
                 bytes_per_sample = 3 if is_24bit else 2
 
+            # Scale from PLUTO raw ADC range (12-bit, ~-2048..+2047) to output range
+            PLUTO_ADC_PEAK = 2048.0
+
             if is_24bit:
                 if packet_size_setting == 1:  # Small
                     header_bytes = b'\x84\x81' if is_complex else b'\x84\x81'
@@ -1317,7 +1320,7 @@ class CloudSDREmulator:
                 else:  # Large
                     header_bytes = b'\xA4\x85' if is_complex else b'\xA4\x85'
                     samples_per_packet = 240
-                scale_factor = 8388607 * 0.7
+                scale_factor = (8388607.0 / PLUTO_ADC_PEAK) * 0.7
             else:  # 16-bit
                 if packet_size_setting == 1:  # Small
                     header_bytes = b'\x04\x82'
@@ -1325,7 +1328,7 @@ class CloudSDREmulator:
                 else:  # Large
                     header_bytes = b'\x04\x84'
                     samples_per_packet = 256 if is_complex else 512
-                scale_factor = 32767 * 0.7
+                scale_factor = (32767.0 / PLUTO_ADC_PEAK) * 0.7
 
             packets_per_block = (total_samples + samples_per_packet - 1) // samples_per_packet
             data_size = samples_per_packet * bytes_per_sample
@@ -1480,28 +1483,36 @@ class CloudSDREmulator:
             is_24bit = bool(capture_mode & 0x80)
 
             # Determine packet parameters (matching B210 format)
+            #
+            # Scale factor: pyadi-iio returns raw ADC values from the AD9363.
+            # The IIO driver sign-extends to 16-bit (-32768..+32767) but the
+            # 12-bit ADC only uses about -2048..+2047 at most signal levels.
+            # We scale these raw values to fill ~70% of the output integer range.
+            #   24-bit output max: 8388607  -> scale = 8388607/2048 * 0.7 ~ 2867
+            #   16-bit output max: 32767    -> scale = 32767/2048 * 0.7  ~ 11.2
+            # This keeps strong signals within range while preserving dynamic range.
+            PLUTO_ADC_PEAK = 2048.0  # 12-bit ADC peak value
+
             if is_24bit:
                 if packet_size_setting == 1:  # Small packets
                     header_bytes = b'\x84\x81'
                     samples_per_packet = 64
                     data_size = 384
-                    scale_factor = 8388607 * 0.7
                 else:  # Large packets
                     header_bytes = b'\xA4\x85'
                     samples_per_packet = 240
                     data_size = 1440
-                    scale_factor = 8388607 * 0.7
+                scale_factor = (8388607.0 / PLUTO_ADC_PEAK) * 0.7
             else:  # 16-bit
                 if packet_size_setting == 1:  # Small packets
                     header_bytes = b'\x04\x82'
                     samples_per_packet = 128
                     data_size = 512
-                    scale_factor = 32767 * 0.7
                 else:  # Large packets
                     header_bytes = b'\x04\x84'
                     samples_per_packet = 256
                     data_size = 1024
-                    scale_factor = 32767 * 0.7
+                scale_factor = (32767.0 / PLUTO_ADC_PEAK) * 0.7
 
             # Pre-allocate buffers
             data_buffer = bytearray(data_size)
@@ -1517,13 +1528,13 @@ class CloudSDREmulator:
             self.logger.info(f"UDP: {samples_per_packet} samples/packet, {packets_per_second:.1f} pps, {packet_interval*1000:.3f}ms interval")
             self.logger.info(f"Streaming PLUTO IQ -> SpectraVue at {udp_addr[0]}:{udp_addr[1]} ({mode_str} {size_str})")
 
-            # High-resolution timing
+            # Timing: we schedule each packet relative to a wall-clock anchor.
+            # If the thread gets stalled (CPU load, GC, etc.) we detect when
+            # we've fallen behind by more than max_behind and re-anchor rather
+            # than trying to burst-catch-up, which would cause rate spikes.
             start_time = time.perf_counter()
             next_packet_time = start_time
-
-            # Timing correction
-            timing_error_accumulator = 0.0
-            timing_correction_factor = 1.0
+            max_behind = packet_interval * 8  # Allow up to 8 packets of drift
 
             # Statistics
             samples_sent = 0
@@ -1634,27 +1645,18 @@ class CloudSDREmulator:
                     self.logger.error(f"Error sending UDP data: {e}")
                     break
 
-                # Timing correction
-                next_packet_time += packet_interval * timing_correction_factor
+                # Advance to next packet time
+                next_packet_time += packet_interval
 
-                # Adaptive timing correction
-                if packet_count % 1000 == 0:
-                    current_time = time.perf_counter()
-
-                    expected_time = start_time + (packet_count * packet_interval)
-                    actual_time = current_time
-                    timing_error = actual_time - expected_time
-                    timing_error_accumulator += timing_error
-
-                    if abs(timing_error_accumulator) > 0.01:  # More than 10ms error
-                        correction = -timing_error_accumulator / (packet_count * packet_interval)
-                        timing_correction_factor = 1.0 + (correction * 0.1)
-                        timing_correction_factor = max(0.95, min(1.05, timing_correction_factor))
-
-                        if self.verbose >= 2:
-                            self.logger.debug(f"Timing correction: {timing_correction_factor:.6f}")
-
-                        timing_error_accumulator *= 0.5
+                # If we've fallen too far behind wall clock (CPU stall, GC pause,
+                # etc.), re-anchor timing to now instead of burst-catching-up.
+                # A brief gap is better than a rate spike.
+                now = time.perf_counter()
+                if now - next_packet_time > max_behind:
+                    skipped = int((now - next_packet_time) / packet_interval)
+                    next_packet_time = now
+                    if self.verbose >= 1:
+                        self.logger.info(f"Timing: re-anchored (skipped {skipped} packet slots)")
 
         except Exception as e:
             self.logger.error(f"UDP sender error: {e}")
